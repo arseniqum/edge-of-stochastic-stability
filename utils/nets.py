@@ -3,16 +3,32 @@ import torch
 import torch.nn as nn
 
 from utils.resnet_new import resnet14, resnet20, ResNet
-from utils.resnet_bn import resnet10 as resnet10_bn, ResNet as ResNetBN
+# from utils.resnet_bn import resnet10 as resnet10_bn, ResNet as ResNetBN
+from utils.resnet_bn_new import resnet14 as resnet14_bn, resnet20 as resnet20_bn, ResNet as ResNetBN
+
+from utils.wrn import WideResNet, WideResNetBlock, WideResNetNoBN, initialize_wrn_fixup
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
 
-from utils.data import get_dataset_presets
 from typing import Union
 from pathlib import Path
 from contextlib import contextmanager
 
+
+SUPPORTED_ACTIVATIONS = {
+    'relu': nn.ReLU,
+    'silu': nn.SiLU,
+    'tanh': nn.Tanh,
+}
+
+
+def activation_factory(name: str) -> nn.Module:
+    activation_key = name.lower()
+    if activation_key not in SUPPORTED_ACTIVATIONS:
+        supported = ', '.join(sorted(SUPPORTED_ACTIVATIONS))
+        raise ValueError(f"Unsupported activation '{name}'. Supported activations: {supported}")
+    return SUPPORTED_ACTIVATIONS[activation_key]()
 
 
 def get_model_presets():
@@ -50,43 +66,78 @@ def get_model_presets():
             'type': 'mlp',
             'params': {
                 'hidden_dim': 512,
-                'n_layers': 2
+                'n_layers': 2,
+                'activation': 'relu',
             }
         },
         'mlp2': {
             'type': 'mlp',
             'params': {
                 'hidden_dim': 256,
-                'n_layers': 2
+                'n_layers': 2,
+                'activation': 'relu',
             }
         },
         'mlp3': {
             'type': 'mlp',
             'params': {
                 'hidden_dim': 256,
-                'n_layers': 3
+                'n_layers': 3,
+                'activation': 'relu',
             }
         },
         'mlp_s': {
             'type': 'mlp',
             'params': {
                 'hidden_dim': 256,
-                'n_layers': 1
+                'n_layers': 1,
+                'activation': 'relu',
             }
         },
         'mlp_l': {
             'type': 'mlp',
             'params': {
                 'hidden_dim': 512,
-                'n_layers': 4
+                'n_layers': 4,
+                'activation': 'relu',
             }
         },
+
+        'mlp_silu': {
+            'type': 'mlp',
+            'params': {
+                'hidden_dim': 512,
+                'n_layers': 2,
+                'activation': 'silu',
+            }
+        },
+        'mlp_tanh': {
+            'type': 'mlp',
+            'params': {
+                'hidden_dim': 512,
+                'n_layers': 2,
+                'activation': 'tanh',
+            }
+        },
+
+
         'cnn': {
             'type': 'cnn',
             'params': {
                 'hidden_dim': 512,
+                'activation': 'relu',
             }
         },
+
+        'cnn_silu': {
+            'type': 'cnn',
+            'params': {
+                'hidden_dim': 512,
+                'activation': 'silu',
+            }
+        },
+
+
         'resnet': {
             'type': 'resnet',
             'params': {},
@@ -94,7 +145,21 @@ def get_model_presets():
         'resnet_bn': {
             'type': 'resnet_bn',
             'params': {},
-        }
+        },
+        'wrn': {
+            'type': 'wrn',
+            'params': {
+                'depth': 10,
+                'width_factor': 2,
+            },
+        },
+        'wrn_no_bn': {
+            'type': 'wrn_no_bn',
+            'params': {
+                'depth': 10,
+                'width_factor': 2,
+            },
+        },
     }
     return model_presets
 
@@ -174,13 +239,15 @@ class SquaredLoss(nn.modules.loss._Loss):
 
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_layers, output_dim):
+    def __init__(self, input_dim, hidden_dim, n_layers, output_dim, activation: str = 'relu'):
         super(MLP, self).__init__()
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
         self.output_dim = output_dim
+        self.activation_name = activation.lower()
+        self.activation = activation_factory(self.activation_name)
 
         self.layers = nn.ModuleList()
 
@@ -192,35 +259,40 @@ class MLP(nn.Module):
     def forward(self, x):
         x = x.flatten(1)
         for layer in self.layers[:-1]:
-            x = F.relu(layer(x))
+            x = self.activation(layer(x))
         x = self.layers[-1](x)
         return x
 
     def __repr__(self):
-        return f"MLP({self.input_dim}, {self.hidden_dim}, {self.n_layers}, {self.output_dim})"
+        return f"MLP({self.input_dim}, {self.hidden_dim}, {self.n_layers}, {self.output_dim}, activation={self.activation_name})"
 
 
 class CNN(nn.Module):
-    def __init__(self, fc_hidden_dim, output_dim):
+    def __init__(self, fc_hidden_dim, output_dim, activation: str = 'relu'):
         super(CNN, self).__init__()
         self.fc_hidden_dim = fc_hidden_dim
+        self.activation_name = activation.lower()
+
+        def act():
+            return activation_factory(self.activation_name)
+
         # self.conv1 = nn.Conv2d(3, 64, 3, 1)
         # self.conv2 = nn.Conv2d(64, 64, 3, 1)
         # self.conv3 = nn.Conv2d(64, 128, 3, 1)
         self.convs = nn.Sequential(
                 nn.Conv2d(3, 64, 3, 1), # 64*30*30
-                nn.ReLU(),
+                act(),
                 nn.Conv2d(64, 64, 3, 1), # 64*28*28
-                nn.ReLU(),
+                act(),
                 nn.MaxPool2d(2, 2), # 64, 14
 
                 nn.Conv2d(64, 128, 3, 1), # 128, 12
-                nn.ReLU(),
+                act(),
                 nn.MaxPool2d(2, 2), # 128, 6
         )
         self.fcs = nn.Sequential(
                 nn.Linear(128*6*6, fc_hidden_dim, bias=True),
-                nn.ReLU(),
+                act(),
                 nn.Linear(fc_hidden_dim, output_dim, bias=True)
         )
         # self.fc1 = nn.Linear(128*6*6, width, bias=False)
@@ -263,21 +335,35 @@ class Linear(nn.Module):
 def prepare_net(model_type: str,
                 params: dict
                 ):
+    activation = params.get('activation', 'relu')
     if model_type == 'linear':
         net = Linear(params['input_dim'], params['hidden_dim'], params['n_layers'], params['output_dim'], params['bias'])
     
     if model_type == 'mlp':
-        net = MLP(params['input_dim'], params['hidden_dim'], params['n_layers'], params['output_dim'])
+        net = MLP(params['input_dim'], params['hidden_dim'], params['n_layers'], params['output_dim'], activation=activation)
     
     if model_type == 'cnn':
-        net = CNN(params['hidden_dim'], params['output_dim'])
+        net = CNN(params['hidden_dim'], params['output_dim'], activation=activation)
     
     if model_type == 'resnet':
-        net = resnet14()
+        net = resnet20()
     
     if model_type == 'resnet_bn':
-        raise "Not implemented - you are still using old resnet_bn"
-        net = resnet10_bn()
+        net = resnet14_bn()
+
+    if model_type == 'wrn':
+        net = WideResNet(
+            depth=params['depth'],
+            widen_factor=params['width_factor'],
+            num_classes=params['output_dim'],
+        )
+    
+    if model_type == 'wrn_no_bn':
+        net = WideResNetNoBN(
+            depth=params['depth'],
+            widen_factor=params['width_factor'],
+            num_classes=params['output_dim'],
+        )
 
     return net
 
@@ -285,8 +371,10 @@ def prepare_net_dataset_specific(model_name: str,
                                  dataset: str,
                                  ):
     '''
-    Returns the model specific to the procided dataset
+    Returns the model specific to the provided dataset
     '''
+    from utils.data import get_dataset_presets
+
     model_presets = get_model_presets()
     params = model_presets[model_name]['params']
     model_type = model_presets[model_name]['type']
@@ -299,32 +387,49 @@ def prepare_net_dataset_specific(model_name: str,
 
     return net
 
-    
+
+def _init_linear_with_activation(module: nn.Linear, activation: str, scale: float):
+    activation = activation.lower()
+    if activation == 'tanh':
+        gain = nn.init.calculate_gain('tanh')
+        nn.init.xavier_normal_(module.weight, gain=gain)
+    else:
+        nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+    module.weight.data.mul_(scale)
+    if module.bias is not None:
+        nn.init.zeros_(module.bias)
+
+
+def _init_conv_with_activation(module: nn.Conv2d, activation: str, scale: float):
+    activation = activation.lower()
+    if activation == 'tanh':
+        gain = nn.init.calculate_gain('tanh')
+        nn.init.xavier_normal_(module.weight, gain=gain)
+    else:
+        nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+    module.weight.data.mul_(scale)
+    if module.bias is not None:
+        nn.init.zeros_(module.bias)
+
 
 def initialize_mlp(net, scale=None):
     if scale is None:
         scale=1
+    activation = getattr(net, 'activation_name', 'relu')
     for m in net.modules():
         if isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight)
-            m.weight.data = m.weight.data * scale
-            nn.init.zeros_(m.bias)
+            _init_linear_with_activation(m, activation, scale)
 
 
 def initialize_cnn(net, scale=None):
     if scale is None:
         scale = 1.0
+    activation = getattr(net, 'activation_name', 'relu')
     for m in net.modules():
         if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-            m.weight.data.mul_(scale)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+            _init_conv_with_activation(m, activation, scale)
         elif isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-            m.weight.data.mul_(scale)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+            _init_linear_with_activation(m, activation, scale)
         elif isinstance(m, nn.BatchNorm2d):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
@@ -343,19 +448,23 @@ def initialize_resnet_old(net, scale=0.01):
 
 def initialize_resnet(net, scale=None):
     if scale is None:
-        scale = 0.01
+        scale = 1
     for m in net.modules():
         if isinstance(m, torch.nn.Conv2d):
             torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            m.weight.data.mul_(scale)
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
         elif isinstance(m, torch.nn.Linear):
-            # torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            m.weight.data.mul_(scale)
             if m.bias is not None:
                 torch.nn.init.constant_(m.bias, 0)
         
-    T.nn.init.normal_(net.linear.weight, std=scale)
+    # T.nn.init.normal_(net.linear.weight, std=scale)
 
 
-def initialize_resnet_bn(net, scale=0.1):
+def initialize_resnet_bn_old(net, scale=0.1):
     for m in net.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -378,6 +487,89 @@ def initialize_resnet_bn(net, scale=0.1):
 
     # custom scale
     net.fc.weight.data *= scale
+
+
+def initialize_resnet_bn(net, scale=None, zero_init_residual=False):
+    if scale is None:
+        scale = 1
+
+    for module in net.modules():
+        if isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            module.weight.data.mul_(scale)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.BatchNorm2d):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='linear')
+            module.weight.data.mul_(scale)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    if not zero_init_residual:
+        return
+
+    for module in net.modules():
+        # Prefer the deepest BN (bn3) when available, otherwise fall back to bn2.
+        final_bn = None
+        if hasattr(module, "bn3") and isinstance(module.bn3, nn.BatchNorm2d):
+            final_bn = module.bn3
+        elif hasattr(module, "bn2") and isinstance(module.bn2, nn.BatchNorm2d):
+            final_bn = module.bn2
+
+        if final_bn is not None:
+            nn.init.zeros_(final_bn.weight)
+
+
+def initialize_wrn(net: WideResNet, scale=None):
+    if scale is None:
+        scale = 1.0
+
+    for module in net.modules():
+        if isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            ### NOTE
+            module.weight.data.mul_(scale)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.BatchNorm2d):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    for block in net.modules():
+        if isinstance(block, WideResNetBlock):
+            nn.init.zeros_(block.bn2.weight)
+
+    nn.init.kaiming_uniform_(net.fc.weight)
+    #### NOTE THE SCALE!
+    net.fc.weight.data.mul_(scale)
+    if net.fc.bias is not None:
+        nn.init.zeros_(net.fc.bias)
+
+
+# def initialize_wrn_old(net, scale=None):
+#     if scale is None:
+#         scale = 1.0
+
+#     for m in net.modules():
+#         if isinstance(m, nn.Conv2d):
+#             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+#             # m.weight.data.mul_(scale)
+#         elif isinstance(m, nn.BatchNorm2d):
+#             nn.init.ones_(m.weight)
+#             nn.init.zeros_(m.bias)
+#         elif isinstance(m, nn.Linear):
+#             nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
+#             # m.weight.data.mul_(scale)
+#             if m.bias is not None:
+#                 nn.init.zeros_(m.bias)
+    
+
+#     # custom scale
+#     net.fc.weight.data *= scale
+
 
 
 def initialize_linear(net, scale=None):
@@ -424,9 +616,13 @@ def initialize_net(net, scale=None, seed=None):
         elif isinstance(net, ResNet):
             initialize_resnet(net, scale=scale)
         elif isinstance(net, ResNetBN):
-            initialize_resnet_bn(net, scale=scale)
+            initialize_resnet_bn(net, scale=scale, zero_init_residual=False)
         elif isinstance(net, CNN):
             initialize_cnn(net, scale=scale)
+        elif isinstance(net, WideResNet):
+            initialize_wrn(net, scale=scale)
+        elif isinstance(net, WideResNetNoBN):
+            initialize_wrn_fixup(net)
         else:
             raise ValueError("Unknown net type")
 

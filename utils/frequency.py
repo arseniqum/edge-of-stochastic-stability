@@ -22,6 +22,8 @@ class MeasurementContext:
     precise_plots: bool = False
     # Rare-measure regime: sparsify expensive measurements
     rare_measure: bool = False
+    # Force early full loss logging
+    steps_since_restart: int = 0
     # Add other variables as needed
 
 
@@ -58,7 +60,7 @@ class FrequencyCalculator:
             if ctx.batch_size <= 33:
                 base_freq = 256
             else:
-                base_freq = 64
+                base_freq = 256
 
             if ctx.precise_plots:
                 base_freq = min(base_freq, 32)
@@ -85,8 +87,10 @@ class FrequencyCalculator:
             # FIRST_SUPER_FEW = 128
             if ctx.batch_size < 33:
                 base_freq = 128
-            else:
+            elif ctx.batch_size < 128:
                 base_freq = 64
+            else:
+                base_freq = 32
 
             if ctx.step_number < 10 / ctx.lr:
                 if ctx.batch_size < 33:
@@ -121,24 +125,75 @@ class FrequencyCalculator:
         
         def batch_lambda_max_rule(ctx: MeasurementContext) -> bool:
             """Batch lambda max frequency rule."""
-            if ctx.batch_size > 32:
-                base_freq = 16
+
+            # Base frequency depends on batch size
+            if ctx.batch_size <= 33:
+                base_freq = 512
+            else:
+                base_freq = 128
+
+            if ctx.precise_plots:
+                base_freq = min(base_freq, 32)
+
+            
+            # Reduce frequency as training progresses
+            freq = base_freq
+            if ctx.step_number > 10_000:
+                freq *= 2
+            if ctx.step_number > 30_000:
+                freq *= 2
+            # if ctx.step_number > 100_000:
+                # freq *= 2
+            
+            
+            # Rare-measure: make much rarer
+            freq = _rare_scale(ctx, freq, heavy=True)
+
+            return ctx.step_number % freq == 0
+
+        def full_batch_lambda_max_gn_rule(ctx: MeasurementContext) -> bool:
+            """Gauss-Newton analog of full batch lambda max; mirrors Hessian cadence."""
+            return full_batch_lambda_max_rule(ctx)
+
+        def step_batch_lambda_max_rule(ctx: MeasurementContext) -> bool:
+            """Lambda max on the live mini-batch (single batch)."""
+            if ctx.batch_size <= 33:
+                base_freq = 32
             else:
                 base_freq = 32
-                if ctx.batch_size > 16:
-                    base_freq = 64
-            
+
+            if ctx.step_number < max(1, int(10 / max(ctx.lr, 1e-8))):
+                base_freq = min(base_freq, 16)
+
             freq = base_freq
-            # Rare-measure: lightly sparsify batch variant
-            freq = _rare_scale(ctx, freq, heavy=False)
-            return ctx.step_number % freq == 0
+            if ctx.step_number > 10_000:
+                freq *= 2
+            if ctx.step_number > 30_000:
+                freq *= 2
+
+            freq = _rare_scale(ctx, freq, heavy=True)
+            return ctx.step_number % max(1, freq) == 0
+        
+            # # if ctx.batch_size > 32:
+            # #     base_freq = 16
+            # # else:
+            # #     base_freq = 32
+            # #     if ctx.batch_size > 16:
+            # #         base_freq = 64
+
+
+            
+            # freq = base_freq
+            # # Rare-measure: lightly sparsify batch variant
+            # freq = _rare_scale(ctx, freq, heavy=False)
+            # return ctx.step_number % freq == 0
         
         def batch_sharpness_rule(ctx: MeasurementContext) -> bool:
             """Batch sharpness frequency rule (expected Rayleigh quotient)."""
             if ctx.batch_size < 33:
                 base_freq = 128
             else:
-                base_freq = 32
+                base_freq = 128
             
             freq = base_freq
             if ctx.step_number > 10_000:
@@ -149,7 +204,41 @@ class FrequencyCalculator:
                 freq *= 2
                 
             # Preferred batch sharpness; light sparsification only
-            freq = _rare_scale(ctx, freq, heavy=False)
+            freq = _rare_scale(ctx, freq, heavy=True)
+            return ctx.step_number % freq == 0
+
+        def batch_sharpness_gn_rule(ctx: MeasurementContext) -> bool:
+            """Gauss-Newton batch sharpness cadence; reuses Hessian schedule."""
+            return batch_sharpness_rule(ctx)
+        
+        def momentum_batch_sharpness_rule(ctx: MeasurementContext) -> bool:
+            """Momentum-aware batch sharpness cadence; mirrors batch sharpness."""
+            return batch_sharpness_rule(ctx)
+        
+
+        def second_moment_contraction_rule(ctx: MeasurementContext) -> bool:
+            # Base frequency depends on batch size
+            if ctx.batch_size <= 33:
+                base_freq = 256
+            else:
+                base_freq = 256
+
+            if ctx.precise_plots:
+                base_freq = min(base_freq, 32)
+
+            # Reduce frequency as training progresses
+            freq = base_freq
+            if ctx.step_number > 10_000:
+                freq *= 2
+            if ctx.step_number > 30_000:
+                freq *= 2
+            # if ctx.step_number > 100_000:
+                # freq *= 2
+            
+            
+            # Rare-measure: make much rarer
+            freq = _rare_scale(ctx, freq, heavy=True)
+
             return ctx.step_number % freq == 0
         
         
@@ -287,11 +376,29 @@ class FrequencyCalculator:
             return ctx.step_number % 32 == 0
         
         def full_loss_rule(ctx: MeasurementContext) -> bool:
-            """Full loss calculation frequency rule (for GNI)."""
+            """Full loss calculation frequency rule for --force-full-loss."""
+            warmup_steps = getattr(ctx, 'full_loss_warmup_steps', 0)
+            if getattr(ctx, 'force_full_loss_warmup', False) and ctx.steps_since_restart < warmup_steps:
+                return True
+
             freq = 32
-            # Rare-measure: full-dataset forward is expensive
+            if ctx.step_number > 10_000:
+                freq *= 2
+            if ctx.step_number > 50_000:
+                freq *= 2
+
             freq = _rare_scale(ctx, freq, heavy=True)
+            freq = max(1, freq)
             return ctx.step_number % freq == 0
+    
+        def full_loss_warmup_rule(ctx: MeasurementContext) -> bool:
+            """Full loss warmup measurement frequency rule."""
+            warmup_steps = 128
+
+            if ctx.steps_since_restart < warmup_steps:
+                return True
+
+            return False
 
         def gradient_norm_squared_rule(ctx: MeasurementContext) -> bool:
             """Gradient norm squared measurement frequency rule."""
@@ -365,14 +472,23 @@ class FrequencyCalculator:
             tuned centrally later without changing training code.
             """
             return True
+
+        def trajectory_projection_rule(ctx: MeasurementContext) -> bool:
+            """Trajectory projection logging cadence (fixed at every 32 steps)."""
+            return ctx.step_number % 32 == 0
         
         # Register all default rules
         self.rules.update({
             'full_batch_lambda_max': full_batch_lambda_max_rule,
             'full_batch_lambda_max_early': full_batch_lambda_max_early_rule,
+            'full_batch_lambda_max_gn': full_batch_lambda_max_gn_rule,
+            'second_moment_contraction': second_moment_contraction_rule,
             'batch_lambda_max': batch_lambda_max_rule,
+            'step_batch_lambda_max': step_batch_lambda_max_rule,
             'step_sharpness': step_sharpness_rule,
             'batch_sharpness': batch_sharpness_rule,
+            'batch_sharpness_gn': batch_sharpness_gn_rule,
+            'momentum_batch_sharpness': momentum_batch_sharpness_rule,
             'batch_sharpness_exp_inside': batch_sharpness_exp_inside_rule,
             'full_ghg': full_ghg_rule,
             'hessian_trace': hessian_trace_rule,
@@ -383,10 +499,12 @@ class FrequencyCalculator:
             'param_distance': param_distance_rule,
             'checkpoint': checkpoint_rule,
             'full_loss': full_loss_rule,
+            'full_loss_warmup': full_loss_warmup_rule,
             'gradient_norm_squared': gradient_norm_squared_rule,
             'one_step_loss_change': one_step_loss_change_rule,
             'grad_projection': grad_projection_rule,
-            'proj_eigens_refresh': proj_eigens_refresh_rule
+            'proj_eigens_refresh': proj_eigens_refresh_rule,
+            'trajectory_projection': trajectory_projection_rule,
         })
     
     def should_measure(self, measurement_type: str, ctx: MeasurementContext) -> bool:

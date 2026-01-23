@@ -1,4 +1,4 @@
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional
 import pickle
 import os
 
@@ -8,9 +8,49 @@ import torch.nn as nn
 from einops import rearrange, repeat
 import numpy as np
 from torchvision import datasets
+import torchvision.transforms as transforms
 from torch.utils.data import Dataset
 from pathlib import Path
 import torch.nn.functional as F
+
+
+CINIC10_MEAN = [0.47889522, 0.47227842, 0.43047404]
+CINIC10_STD = [0.24205776, 0.23828046, 0.25874835]
+
+
+def _load_cinic10_dataset(
+    dataset: datasets.ImageFolder,
+    count: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load up to `count` samples from an ImageFolder into contiguous tensors."""
+    total = len(dataset) if count is None else min(count, len(dataset))
+    if total == 0:
+        return (
+            torch.empty((0, 3, 32, 32), dtype=torch.float32),
+            torch.empty((0,), dtype=torch.long),
+        )
+    X = torch.empty((total, 3, 32, 32), dtype=torch.float32)
+    Y = torch.empty((total,), dtype=torch.long)
+    for idx in range(total):
+        image, label = dataset[idx]
+        X[idx] = image
+        Y[idx] = label
+    return X, Y
+
+
+def _fill_from_dataset(
+    dataset: datasets.ImageFolder,
+    dest_x: torch.Tensor,
+    dest_y: torch.Tensor,
+    offset: int,
+    count: int,
+) -> None:
+    """Copy `count` samples from dataset into preallocated destination tensors."""
+    for local_idx in range(count):
+        image, label = dataset[local_idx]
+        dest_x[offset + local_idx] = image
+        dest_y[offset + local_idx] = label
+
 
 
 
@@ -36,6 +76,10 @@ def get_dataset_presets():
             },
             'fmnist': {
                 'input_dim': 1*28*28,
+                'output_dim': 10
+            },
+            'cinic10': {
+                'input_dim': 3*32*32,
                 'output_dim': 10
             },
             'imagenet32': {
@@ -101,6 +145,77 @@ def prepare_cifar10_2cls(dataset_folder: Path, num_data: int, classes: list, dat
             Y_test = Y
         
     return X_train, Y_train, X_test, Y_test
+
+
+def prepare_cinic10(
+    dataset_folder: Path,
+    num_data: int,
+    dataset_seed: int = 888,
+    loss_type: str = 'mse',
+):
+    _ = dataset_seed  # deterministic ordering; no random sub-sampling
+    datafolder = dataset_folder / 'cinic10'
+    train_dir = datafolder / 'train'
+    valid_dir = datafolder / 'valid'
+    test_dir = datafolder / 'test'
+
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=CINIC10_MEAN, std=CINIC10_STD),
+        ]
+    )
+
+    train_dataset = datasets.ImageFolder(train_dir, transform=transform)
+    valid_dataset = datasets.ImageFolder(valid_dir, transform=transform)
+    test_dataset = datasets.ImageFolder(test_dir, transform=transform)
+
+    test_X, test_Y = _load_cinic10_dataset(test_dataset, count=None)
+
+    train_len = len(train_dataset)
+    valid_len = len(valid_dataset)
+    test_len = len(test_dataset)
+    total_available = train_len + valid_len + test_len
+
+    if num_data < 0:
+        raise ValueError("num_data must be non-negative for CINIC-10")
+    if num_data > total_available:
+        raise ValueError(
+            f"Requested {num_data} samples but only {total_available} are available in CINIC-10"
+        )
+
+    if num_data == 0:
+        X_train = torch.empty((0, 3, 32, 32), dtype=torch.float32)
+        Y_train = torch.empty((0,), dtype=torch.long)
+    else:
+        X_train = torch.empty((num_data, 3, 32, 32), dtype=torch.float32)
+        Y_train = torch.empty((num_data,), dtype=torch.long)
+
+        offset = 0
+        take_train = min(num_data, train_len)
+        if take_train > 0:
+            _fill_from_dataset(train_dataset, X_train, Y_train, offset, take_train)
+            offset += take_train
+
+        remaining = num_data - offset
+        take_valid = min(remaining, valid_len)
+        if take_valid > 0:
+            _fill_from_dataset(valid_dataset, X_train, Y_train, offset, take_valid)
+            offset += take_valid
+
+        remaining = num_data - offset
+        if remaining > 0:
+            X_train[offset:offset + remaining] = test_X[:remaining]
+            Y_train[offset:offset + remaining] = test_Y[:remaining]
+
+    if loss_type == 'mse':
+        Y_train = F.one_hot(Y_train.long(), num_classes=10).float()
+        Y_test = F.one_hot(test_Y.long(), num_classes=10).float()
+    else:
+        Y_train = Y_train.long()
+        Y_test = test_Y.long()
+
+    return X_train, Y_train, test_X, Y_test
 
 
 def prepare_cifar10(dataset_folder: Path, 
@@ -451,6 +566,8 @@ def prepare_dataset(dataset: str, dataset_folder: Union[str, Path], num_data: in
         return prepare_svhn(dataset_folder, num_data, dataset_seed=dataset_seed, loss_type=loss_type)
     if dataset == 'fmnist':
         return prepare_fmnist(dataset_folder, num_data, dataset_seed=dataset_seed, loss_type=loss_type)
+    if dataset == 'cinic10':
+        return prepare_cinic10(dataset_folder, num_data, dataset_seed=dataset_seed, loss_type=loss_type)
     if dataset == 'imagenet32':
         return prepare_imagenet32(dataset_folder, num_data, dataset_seed=dataset_seed, loss_type=loss_type)
     

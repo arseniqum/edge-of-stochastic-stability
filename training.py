@@ -15,8 +15,8 @@ import time
 
 from utils.data import prepare_dataset, get_dataset_presets
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
-from utils.nets import ResNet
-from utils.storage import initialize_folders
+from utils.nets import ResNet, WideResNet, WideResNetNoBN
+from utils.storage import initialize_folders, write_json_atomic
 from utils.wandb_utils import (
     init_wandb,
     log_metrics,
@@ -26,12 +26,12 @@ from utils.wandb_utils import (
     get_checkpoint_dir_for_run,
     is_wandb_available,
     generate_run_id,
+    save_trajectory_projection,
 )
 from utils.noise import gd_with_noise, GradStorage, sde_integration
 from utils.measure import *
 from utils.frequency import frequency_calculator, MeasurementContext
 from utils.quadratic import QuadraticApproximation, flatten_params, set_model_params, unflatten_params
-
 from torch.autograd import grad
 import json
 
@@ -40,9 +40,9 @@ if 'DATASETS' not in os.environ:
 if 'RESULTS' not in os.environ:
     raise ValueError("Please set the environment variable 'RESULTS'. Use 'export RESULTS=/path/to/results'")
 
-DATASET_FOLDER = Path(os.environ.get('DATASETS'))
+DATASET_FOLDER = Path(os.environ.get('DATASETS')).expanduser()
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
-RES_FOLDER = Path(os.environ.get('RESULTS'))
+RES_FOLDER = Path(os.environ.get('RESULTS')).expanduser()
 
 
 # -------------------------------------
@@ -51,7 +51,7 @@ RES_FOLDER = Path(os.environ.get('RESULTS'))
 
 class MeasurementRunner:
     """Centralized measurement orchestration for the training loop."""
-    _FIRST_FEW_FULL_LOSS_STEPS = 32
+    # _FIRST_FEW_FULL_LOSS_STEPS = 32
 
     def __init__(
         self,
@@ -74,6 +74,9 @@ class MeasurementRunner:
         gd_noise,
         proj_switch_step,
         quad_approx,
+        run_id,
+        wandb_run,
+        wandb_enabled,
     ):
         self.net = net
         self.loss_fn = loss_fn
@@ -92,6 +95,12 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
+        self.run_id = run_id
+        self.wandb_run = wandb_run
+        self.wandb_enabled = wandb_enabled
+        self.trajectory_projector = None
+        # self.full_loss_warmup_steps = self._FIRST_FEW_FULL_LOSS_STEPS
+        self._momentum_bs_warned = False
 
         self.eigenvalues_log = []
         if 'lmax' in measurements and num_eigenvalues > 1:
@@ -101,10 +110,31 @@ class MeasurementRunner:
         else:
             self.eigenvalues_file = None
 
+        if eigenvector_cache is not None and 'lambda_max_gn' in measurements:
+            self.gn_eigenvector_cache = EigenvectorCache(max_eigenvectors=eigenvector_cache.max_eigenvectors)
+        else:
+            self.gn_eigenvector_cache = None
+
+        if 'trajectory_projection' in measurements:
+            self._init_trajectory_projection()
+
     def close(self):
         if self.eigenvalues_file is not None:
             self.eigenvalues_file.write('\n]')
             self.eigenvalues_file.close()
+
+    def _init_trajectory_projection(self):
+        """
+        Initialize (or load) the trajectory projection matrix for deterministic logging.
+        """
+        param_dim = param_length(self.net)
+        device = next(self.net.parameters()).device
+        dtype = next(self.net.parameters()).dtype
+        self.trajectory_projector = make_sparse_jl_projector(
+            param_dim=param_dim,
+            device=device,
+            dtype=dtype,
+        )
 
     def collect(
         self,
@@ -118,10 +148,14 @@ class MeasurementRunner:
         step_number,
     ):
         metrics = {
-            'batch_lmax': np.nan,
+            'batch_lambda_max': np.nan,
+            'max_batch_lambda_max': np.nan,
+            'step_batch_lambda_max': np.nan,
             'step_sharpness': np.nan,
             'batch_sharpness': np.nan,
             'batch_sharpness_exp_inside': np.nan,
+            'momentum_batch_sharpness': np.nan,
+            'second_moment_contraction': np.nan,
             'fisher_batch_eigenval': np.nan,
             'fisher_total_eigenval': np.nan,
             'full_accuracy': np.nan,
@@ -133,14 +167,26 @@ class MeasurementRunner:
             'param_distance': np.nan,
             'gradient_norm_squared': np.nan,
             'lmax': np.nan,
+            'lambda_max_gn': np.nan,
             'all_eigenvalues': None,
             'quadratic_loss': None,
             'quadratic_loss_gn': None,
             'proj_grad_ratio': None,
             'hessian_trace': np.nan,
+            'batch_sharpness_gn': np.nan,
+            'trajectory_proj_norm': np.nan,
         }
 
         epoch_loss_update = None
+
+
+        # # Switch into eval mode for measurements
+        # was_training = self.net.training
+        # self.net.eval()
+        # NOTE: this would only matter when we have BN or Dropout
+        # yet, it is unclear whether we should do it or not, since training mode is what
+        # the model will be in when we do the step, so the stability would be determined by
+        # the training mode behavior. Not using eval() for now.
 
 
         # ----- Batch sharpness (expected Rayleigh quotient) -----
@@ -156,6 +202,39 @@ class MeasurementRunner:
                     min_estimates=20,
                     eps=0.005,
                 )
+        if 'batch_sharpness_gn' in self.measurements:
+            if frequency_calculator.should_measure('batch_sharpness_gn', ctx):
+                metrics['batch_sharpness_gn'] = calculate_averaged_grad_H_grad_step(
+                    self.net,
+                    self.X,
+                    self.Y,
+                    self.loss_fn,
+                    batch_size=self.batch_size,
+                    n_estimates=1000,
+                    min_estimates=20,
+                    eps=0.005,
+                    use_gauss_newton=True,
+                )
+        if 'momentum_batch_sharpness' in self.measurements:
+            if frequency_calculator.should_measure('momentum_batch_sharpness', ctx):
+                try:
+                    metrics['momentum_batch_sharpness'] = calculate_momentum_batch_sharpness(
+                        net=self.net,
+                        optimizer=optimizer,
+                        X=self.X,
+                        Y=self.Y,
+                        loss_fn=self.loss_fn,
+                        batch_size=self.batch_size,
+                        n_estimates=1000,
+                        min_estimates=20,
+                        eps=0.005,
+                    )
+                except ValueError as exc:
+                    if not self._momentum_bs_warned:
+                        print(f"Skipping momentum batch sharpness: {exc}")
+                        self._momentum_bs_warned = True
+                except RuntimeError as exc:
+                    print(f"Momentum batch sharpness failed: {exc}")
         # ----- Instantaneous step sharpness (current-batch Rayleigh quotient) -----
         if 'step_sharpness' in self.measurements:
             if frequency_calculator.should_measure('step_sharpness', ctx):
@@ -183,6 +262,8 @@ class MeasurementRunner:
                         lmax_max_size = 2048 + 512
                     if isinstance(self.net, ResNet):
                         lmax_max_size = 512
+                    if isinstance(self.net, WideResNet) or isinstance(self.net, WideResNetNoBN):
+                        lmax_max_size = 1024
 
             if len(self.X) > lmax_max_size:
                 print(f"Warning: Computing eigenvalues on subset of {lmax_max_size} samples instead of full dataset ({len(self.X)} samples) due to memory/time constraints. Most of the time it is fine, but should be corrected")
@@ -264,6 +345,110 @@ class MeasurementRunner:
                 f"Loss = {metrics['full_loss']} !!!"
             )
 
+        gn_lmax_now = False
+        if 'lambda_max_gn' in self.measurements:
+            gn_lmax_now = frequency_calculator.should_measure('full_batch_lambda_max_gn', ctx)
+
+        if gn_lmax_now:
+            if str(self.device).startswith('cuda'):
+                torch.cuda.empty_cache()
+            optimizer.zero_grad()
+
+            lmax_max_size = 4096
+            if str(self.device).startswith('cuda'):
+                total_memory = torch.cuda.get_device_properties(0).total_memory
+                if total_memory < 20 * 1024**3:
+                    if isinstance(self.net, CNN):
+                        lmax_max_size = 2048 + 512
+                    if isinstance(self.net, ResNet):
+                        lmax_max_size = 512
+                    if isinstance(self.net, WideResNet) or isinstance(self.net, WideResNetNoBN):
+                        lmax_max_size = 1024
+
+            if len(self.X) > lmax_max_size:
+                print(
+                    f"Warning: Computing Gauss-Newton eigenvalues on subset of {lmax_max_size} samples "
+                    f"instead of full dataset ({len(self.X)} samples)."
+                )
+                idx = gimme_random_subset_idx(len(self.X), lmax_max_size)
+                X_subset = self.X[idx]
+                Y_subset = self.Y[idx]
+            else:
+                X_subset = self.X
+                Y_subset = self.Y
+
+            max_iterations = 100 if not self.use_power_iteration else 1000
+            tolerance = 0.005 if self.num_eigenvalues < 6 else 0.03
+            if self.precise_plots:
+                max_iterations = 300 if not self.use_power_iteration else 3000
+                tolerance = 0.001 if self.num_eigenvalues < 6 else 0.01
+
+            gn_cache = self.gn_eigenvector_cache if self.gn_eigenvector_cache is not None else None
+            gn_eigenvalues = compute_gauss_newton_eigenvalues(
+                self.net,
+                X_subset,
+                Y_subset,
+                self.loss_fn,
+                k=self.num_eigenvalues,
+                max_iterations=max_iterations,
+                reltol=tolerance,
+                eigenvector_cache=gn_cache,
+                use_power_iteration=self.use_power_iteration,
+            )
+
+            if self.num_eigenvalues == 1:
+                gn_lmax_value = gn_eigenvalues
+            else:
+                gn_lmax_value = gn_eigenvalues[0]
+
+            metrics['lambda_max_gn'] = gn_lmax_value.item()
+
+            print(
+                f"Epoch {epoch + 1}, Step {step_in_epoch}: Gauss-Newton lambda max = {metrics['lambda_max_gn']}"
+            )
+
+        if 'full_loss_warmup' in self.measurements:
+            if frequency_calculator.should_measure('full_loss_warmup', ctx):
+                with torch.no_grad():
+                    full_preds = self.net(self.X).squeeze(dim=-1)
+                    full_loss_tensor = self.loss_fn(full_preds, self.Y)
+                    full_accuracy_value = calculate_accuracy(full_preds, self.Y)
+                metrics['full_loss'] = float(full_loss_tensor.item())
+                metrics['full_accuracy'] = float(full_accuracy_value)
+                epoch_loss_update = metrics['full_loss']
+
+        if 'full_loss' in self.measurements:
+            if frequency_calculator.should_measure('full_loss', ctx):
+                if np.isnan(metrics['full_loss']):
+                    with torch.no_grad():
+                        full_preds = self.net(self.X).squeeze(dim=-1)
+                        full_loss_tensor = self.loss_fn(full_preds, self.Y)
+                        metrics['full_loss'] = float(full_loss_tensor.item())
+                        metrics['full_accuracy'] = float(calculate_accuracy(full_preds, self.Y))
+                # elif np.isnan(metrics['full_accuracy']):
+                #     with torch.no_grad():
+                #         full_preds = self.net(self.X).squeeze(dim=-1)
+                #         metrics['full_accuracy'] = float(calculate_accuracy(full_preds, self.Y))
+                epoch_loss_update = metrics['full_loss']
+
+        if 'second_moment_contraction' in self.measurements:
+            if frequency_calculator.should_measure('second_moment_contraction', ctx):
+                lr = optimizer.param_groups[0].get('lr') if optimizer.param_groups else None
+                if lr is None:
+                    raise ValueError("Unable to read learning rate for second moment contraction measurement.")
+                try:
+                    metrics['second_moment_contraction'] = calculate_second_moment_contraction(
+                        net=self.net,
+                        X=self.X,
+                        Y=self.Y,
+                        loss_fn=self.loss_fn,
+                        batch_size=self.batch_size,
+                        eta=lr,
+                        n_batches_in_expectation=128,
+                    )
+                except ImportError as exc:
+                    print(f"Skipping second moment contraction measurement (SciPy required): {exc}")
+
         
 
         if 'hessian_trace' in self.measurements:
@@ -310,6 +495,19 @@ class MeasurementRunner:
                 raise ValueError('Parameter reference must be provided for param_distance measurement')
             if frequency_calculator.should_measure('param_distance', ctx):
                 metrics['param_distance'] = calculate_param_distance(self.net, self.param_reference).item()
+
+        # ----- Trajectory projection logging -----
+        if 'trajectory_projection' in self.measurements:
+            if self.trajectory_projector is None:
+                raise RuntimeError("Trajectory projector not initialized.")
+            if frequency_calculator.should_measure('trajectory_projection', ctx):
+                projection = project_params(self.net, self.trajectory_projector)
+                metrics['trajectory_proj_norm'] = torch.linalg.vector_norm(projection).item()
+                save_trajectory_projection(
+                    projection=projection,
+                    step=step_number,
+                    run_id=self.run_id,
+                )
 
         # ----- Gradient norm squared estimate -----
         if 'gradient_norm' in self.measurements:
@@ -388,33 +586,63 @@ class MeasurementRunner:
                     self.Y,
                     self.loss_fn,
                     batch_size=self.batch_size,
-                    n_estimates=1000,
+                    expectation_inside=True,
+                    n_estimates=500,
                     min_estimates=20,
                     eps=0.005,
                 )
 
+        # ----- Step batch lambda max (single-batch eigenvalue) -----
+        if 'step_batch_lambda_max' in self.measurements:
+            if frequency_calculator.should_measure('step_batch_lambda_max', ctx):
+                self.net.zero_grad(set_to_none=True)
+                metrics['step_batch_lambda_max'] = calculate_step_batch_lambdamax(
+                    self.net,
+                    X_batch,
+                    Y_batch,
+                    self.loss_fn,
+                )
 
         # ----- Batch lambda max -----
         batch_lmax_now = False
-        if 'batch_lmax' in self.measurements:
+        if 'batch_lambda_max' in self.measurements:
             if self.gd_noise is None:
                 batch_lmax_now = frequency_calculator.should_measure('batch_lambda_max', ctx)
             else:
                 raise ValueError('Batch lambda max not implemented for GD noise')
 
         if batch_lmax_now:
-            optimizer.zero_grad()
-            preds = self.net(X_batch).squeeze(dim=-1)
-            loss = self.loss_fn(preds, Y_batch)
-            batch_lmax = compute_eigenvalues(loss, self.net, k=1, max_iterations=50, reltol=1e-3)
-            metrics['batch_lmax'] = batch_lmax.item()
-            print(
-                f"Epoch {epoch + 1}, Step {step_in_epoch}: Batch Lambda Max = {metrics['batch_lmax']}, "
-                f"Loss = {loss.item()}"
+            # OLD PROCEDURE:
+            # optimizer.zero_grad()
+            # preds = self.net(X_batch).squeeze(dim=-1)
+            # loss = self.loss_fn(preds, Y_batch)
+            # batch_lmax = compute_eigenvalues(loss, self.net, k=1, max_iterations=50, reltol=1e-3)
+            # metrics['batch_lmax'] = batch_lmax.item()
+            # print(
+            #     f"Epoch {epoch + 1}, Step {step_in_epoch}: Batch Lambda Max = {metrics['batch_lmax']}, "
+            #     f"Loss = {loss.item()}"
+            # )
+            batch_lmaxes = calculate_averaged_lambdamax(
+                self.net,
+                self.X,
+                self.Y,
+                self.loss_fn,
+                batch_size=self.batch_size,
+                tolerance=0.05,
+                n_estimates=50,
+                max_hessian_iters=100,
+                hessian_tolerance=0.05,
             )
+            metrics['batch_lambda_max'] = np.mean(batch_lmaxes)
+            metrics['max_batch_lambda_max'] = np.max(batch_lmaxes)
     
 
         metrics['epoch_loss_update'] = epoch_loss_update
+
+        # # Switch back to training mode if needed
+        # if was_training:
+        #     self.net.train()
+
         return metrics
     
         
@@ -437,6 +665,7 @@ def train(
             verbose=True,
             loss_fn=nn.MSELoss(),
             permute=True,
+            data_ordering_seed=None,
             stop_loss=None,
             epoch_to_start=0,
             step_to_start=0,
@@ -458,6 +687,7 @@ def train(
             quad_switch_lr: float = None,  # lr to use after switching to quadratic approximation
             precise_plots: bool = False,  # Enable more frequent measurements for precise plotting
             rare_measure: bool = False,  # Make expensive measurements rarer
+            full_loss_warmup: bool = False,  # Force dense full-loss measurements right after (re)start
             # Gradient projection configuration
             proj_switch_step: int = None,  # Step to start projecting minibatch gradients
             proj_top_l: int = None,        # Number of top eigendirections to use for projection
@@ -474,7 +704,7 @@ def train(
     print(f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
 
     # ----- Checkpoint Frequency Defaults -----
-    NET_SAVES_PER_TRAINING = 200
+    NET_SAVES_PER_TRAINING = 100
 
     assert max_epochs is not None or max_steps is not None
     if max_epochs is None:
@@ -494,6 +724,12 @@ def train(
     X = X.to(device)
     Y = Y.to(device)
 
+    ordering_generator = None
+    if data_ordering_seed is not None:
+        data_ordering_seed = abs(int(data_ordering_seed))
+        ordering_generator = torch.Generator(device=X.device)
+        ordering_max_seed = 2**63 - 1
+
     # ----- Storage Preparation -----
     save_to.mkdir(parents=True, exist_ok=True)
 
@@ -510,6 +746,7 @@ def train(
 
     # ----- State Initialization -----
     step_number = -1 if step_to_start == 0 else step_to_start
+    steps_since_restart = -1
 
     if gd_noise is not None:
         grad_storage = GradStorage(net, recalculate_every=30)
@@ -546,6 +783,7 @@ def train(
     # ----- Training State Trackers -----
     epoch_loss = float('+inf')
     stop_training = False
+    completed_epoch = epoch_to_start - 1
 
     # -------------------------------------
     # Section: Measurements
@@ -553,7 +791,7 @@ def train(
     # ----- Eigenvector Cache Setup -----
     eigenvector_cache = None
     # Also create cache if gradient projection is enabled, since it relies on cached eigenvectors
-    if (('lmax' in measurements or 'grad_projection' in measurements) or (proj_switch_step is not None)) and cache_eigenvectors:
+    if (('lmax' in measurements or 'grad_projection' in measurements or 'final' in measurements) or (proj_switch_step is not None)) and cache_eigenvectors:
         max_cache = 5
         if num_eigenvalues is not None:
             max_cache = max(max_cache, num_eigenvalues)
@@ -561,6 +799,9 @@ def train(
             max_cache = max(max_cache, proj_top_l)
         eigenvector_cache = EigenvectorCache(max_eigenvectors=max_cache)
     
+    # ----- Run Identification -----
+    run_id = wandb_run_id or generate_run_id()
+
     # ----- Measurement Runner Wiring -----
     measurement_runner = MeasurementRunner(
         net=net,
@@ -581,9 +822,10 @@ def train(
         gd_noise=gd_noise,
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
+        run_id=run_id,
+        wandb_run=wandb_run,
+        wandb_enabled=wandb_enabled,
     )
-    # ----- Run Identification -----
-    run_id = wandb_run_id or generate_run_id()
 
     # If resuming at/after projection switch step, precompute eigendirections immediately
     if proj_switch_step is not None and step_to_start >= proj_switch_step:
@@ -593,17 +835,28 @@ def train(
     # Section: Training Step
     # -------------------------------------
     for epoch in range(epoch_to_start, max_epochs):
+        completed_epoch = epoch
+
         if step_number >= max_steps:
             print(f"Reached max steps {max_steps}, stopping the training")
             results_file.flush()
             results_file.close()
             if wandb_run is not None:
-                wandb_run.finish()
+                # we need wandb_run for the --fiinal 
+                pass
+                # wandb_run.finish()
             break
 
         # --- Epoch Data Preparation ---
-        shuffle = T.randperm(len(X))
         if permute:
+            if ordering_generator is not None:
+                epoch_seed = (data_ordering_seed + epoch) % ordering_max_seed
+                if epoch_seed == 0:
+                    epoch_seed = ordering_max_seed
+                ordering_generator.manual_seed(epoch_seed)
+                shuffle = T.randperm(len(X), generator=ordering_generator, device=X.device)
+            else:
+                shuffle = T.randperm(len(X), device=X.device)
             X_shuffled = X[shuffle]
             Y_shuffled = Y[shuffle]
         else:
@@ -616,9 +869,17 @@ def train(
         if stop_training:
             break
 
+        # initialize the correct starting point for the batch picking
+        location_within_epoch = 0
+        if epoch == epoch_to_start:
+            steps_per_epoch = len(X) // batch_size
+            if step_to_start > 0:
+                location_within_epoch = step_to_start % steps_per_epoch
+
         # --- Minibatch Iteration ---
-        for i in range(0, len(X) // batch_size): # i runs over steps in a epoch
+        for i in range(location_within_epoch, len(X) // batch_size): # i runs over steps in a epoch
             step_number += 1
+            steps_since_restart += 1
 
             msg = f"{epoch:03d}, {step_number:05d}, "
             # --- Measurement Context and Sampling ---
@@ -630,6 +891,7 @@ def train(
                 lr=optimizer.param_groups[0]['lr'],
                 precise_plots=precise_plots,
                 rare_measure=rare_measure,
+                steps_since_restart=steps_since_restart,
             )
 
             X_batch = X_shuffled[i*batch_size : (i+1)*batch_size]
@@ -830,6 +1092,22 @@ def train(
                 # Backward pass for minibatch gradient
                 loss.backward()
 
+                #############
+                # CHANGE THIS FFSSSS
+
+                # Temporarily change learning rate for this step
+                # if step_number < 1000:
+                #     original_lr = optimizer.param_groups[0]['lr']
+                #     optimizer.param_groups[0]['lr'] = 0.001
+                    
+                #     optimizer.step()
+                    
+                #     # Restore original learning rate
+                #     optimizer.param_groups[0]['lr'] = original_lr
+
+                # else:
+                #     optimizer.step()
+
                 optimizer.step()
 
 
@@ -872,9 +1150,11 @@ def train(
                         "batch_loss": batch_loss,
                     })
                     rename_map = {
-                        "batch_lmax": "batch_lambda_max",
+                        # "batch_lmax": "batch_lambda_max",
                         "lmax": "lambda_max",
                         "batch_sharpness": "batch_sharpn",
+                        "batch_sharpness_gn": "batch_sharpn_gn",
+                        "momentum_batch_sharpness": "momentum_bs",
                         "full_gHg": "grad_H_grad",
                         "fisher_batch_eigenval": "batch_fisher_eigenval",
                         "fisher_total_eigenval": "total_fisher_eigenval",
@@ -914,6 +1194,160 @@ def train(
 
     measurement_runner.close()
 
+    if 'final' in measurements:
+        timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime())
+
+        if str(device).startswith('cuda'):
+            torch.cuda.empty_cache()
+
+        optimizer.zero_grad()
+
+        lmax_max_size = 8192
+        if str(device).startswith('cuda'):
+            total_memory = torch.cuda.get_device_properties(0).total_memory
+            if total_memory < 20 * 1024**3:
+                if isinstance(net, CNN):
+                    lmax_max_size = 2048 + 512
+                if isinstance(net, ResNet):
+                    lmax_max_size = 512
+
+        if len(X) > lmax_max_size:
+            print(
+                f"Final lambda_max: using subset of {lmax_max_size} samples "
+                f"instead of full dataset ({len(X)} samples)"
+            )
+            idx = gimme_random_subset_idx(len(X), lmax_max_size)
+            X_subset = X[idx]
+            Y_subset = Y[idx]
+        else:
+            X_subset = X
+            Y_subset = Y
+
+        can_do_extra = (
+            not sde_enabled
+            and gd_noise is None
+            and (quad_approx is None or not quad_approx.is_active)
+            and proj_switch_step is None
+        )
+        extra_steps = 500 if can_do_extra else 0
+        lambda_max_measurements = []
+        eigenvalues_list = []
+        init_vectors = None
+
+        measurements_to_run = 3 if extra_steps else 1
+
+        for measurement_idx in range(measurements_to_run):
+            was_training = net.training
+            net.eval()
+            try:
+                preds = net(X_subset).squeeze(dim=-1)
+                loss = loss_fn(preds, Y_subset)
+                if num_eigenvalues == 1:
+
+                    eigenvalue = compute_eigenvalues(
+                        loss,
+                        net,
+                        k=num_eigenvalues,
+                        max_iterations=200,
+                        reltol=0.01,
+                        eigenvector_cache=eigenvector_cache,
+                        use_power_iteration=use_power_iteration,
+                    )
+                    
+                    lambda_val = float(eigenvalue.item())
+                    if measurement_idx == measurements_to_run - 1:
+                        eigenvalues_list = [lambda_val]
+                else:
+                    raise NotImplementedError("Final measurement for multiple eigenvalues not implemented yet")
+                    # if request_vectors:
+                    #     eigenvalues, eigenvectors = compute_eigenvalues(
+                    #         loss,
+                    #         net,
+                    #         k=num_eigenvalues,
+                    #         max_iterations=200,
+                    #         reltol=0.01,
+                    #         init_vectors=init_vectors,
+                    #         eigenvector_cache=eigenvector_cache,
+                    #         return_eigenvectors=True,
+                    #         use_power_iteration=use_power_iteration,
+                    #     )
+                    #     init_vectors = eigenvectors.detach()
+                    # else:
+                    #     eigenvalues = compute_eigenvalues(
+                    #         loss,
+                    #         net,
+                    #         k=num_eigenvalues,
+                    #         max_iterations=200,
+                    #         reltol=0.01,
+                    #         init_vectors=init_vectors,
+                    #         eigenvector_cache=eigenvector_cache,
+                    #         use_power_iteration=use_power_iteration,
+                    #     )
+                    # lambda_val = float(eigenvalues[0].item())
+                    # if measurement_idx == measurements_to_run - 1:
+                    #     eigenvalues_list = [float(ev.item() if hasattr(ev, 'item') else ev) for ev in eigenvalues]
+
+                lambda_max_measurements.append(lambda_val)
+                full_loss_value = float(loss.item())
+                full_accuracy_value = float(calculate_accuracy(preds, Y_subset))
+            finally:
+                net.train(was_training)
+
+            if extra_steps and measurement_idx == 0:
+                for _ in range(extra_steps):
+                    step_number += 1
+                    batch_indices = torch.randint(len(X), (batch_size,), device=device)
+                    X_batch = X[batch_indices]
+                    Y_batch = Y[batch_indices]
+                    optimizer.zero_grad()
+                    preds_extra = net(X_batch).squeeze(dim=-1)
+                    extra_loss = loss_fn(preds_extra, Y_batch)
+                    if math.isinf(extra_loss.item()) or math.isnan(extra_loss.item()):
+                        raise ValueError("Loss is inf or NaN during final extra steps, stopping the training")
+                    extra_loss.backward()
+                    optimizer.step()
+                optimizer.zero_grad()
+
+        lambda_max_value = sum(lambda_max_measurements) / len(lambda_max_measurements)
+
+        final_step_number = max(step_number, 0)
+        final_epoch_index = max(completed_epoch, 0)
+
+        final_metrics = {
+            "lambda_max": lambda_max_value,
+            "lambda_maxes": lambda_max_measurements,
+            "eigenvalues": eigenvalues_list,
+            "full_loss": full_loss_value,
+            "full_accuracy": full_accuracy_value,
+            "step": final_step_number,
+            "epoch": final_epoch_index,
+            "dataset_size": int(len(X)),
+            "subset_size": int(len(X_subset)),
+            "num_eigenvalues": int(num_eigenvalues),
+            "use_power_iteration": bool(use_power_iteration),
+            "run_id": run_id,
+            "timestamp": timestamp,
+        }
+
+        final_json_path = save_to / 'final.json'
+        write_json_atomic(final_json_path, final_metrics)
+        print(f"Final lambda max measurements = {lambda_max_measurements}, avg = {lambda_max_value:.6f}")
+        print(f"Final loss = {full_loss_value:.6f}, accuracy = {full_accuracy_value:.4f}")
+        print(f"Final metrics saved to {final_json_path}")
+        if wandb_enabled:
+            final_wandb_metrics = {
+                "step": final_step_number,
+                "final_lambda_max": lambda_max_value,
+                "final_lambda_maxes": lambda_max_measurements[0],
+                "final_full_loss": full_loss_value,
+                "final_accuracy": full_accuracy_value,
+            }
+            log_metrics(final_wandb_metrics)
+
+            # record the rest of the measurements, but at differnt steps
+            for i in range(1, len(lambda_max_measurements)):
+                log_metrics({"final_lambda_maxes": lambda_max_measurements[i]})
+
     # ----- WandB Teardown -----
     if wandb_run is not None:
         wandb_run.finish()
@@ -923,15 +1357,6 @@ def train(
     print(f"Training finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
     print(f"Total training time: {end_time - start_time:.2f} seconds")
 
-
-
-    # ----- Optional Final Measurements -----
-    if 'final' in measurements:
-        final_file = save_to / 'final.json'
-        final_file = open(final_file, 'w') 
-
-        # do the final measurements here - depending on what is needed
-    
 
 
 
@@ -967,6 +1392,8 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset to use for training')
     parser.add_argument('--classes', type=int, nargs=2, default=[1, 9], help='Two class labels to use for training. Default is [1, 9], as being probably the most difficult classes to separate')
     parser.add_argument('--num-data', '--num_data', type=int, default=1024, help='Number of datapoints to train on')
+    parser.add_argument('--data-ordering-seed', '--data_ordering_seed', type=int, default=None,
+                        help='Base seed that controls the epoch-wise shuffling of the training data')
 
     # --- Model Configuration ---
     parser.add_argument('--model', type=str, default='mlp', help='Network architecture to use for training')
@@ -985,26 +1412,39 @@ if __name__ == '__main__':
     # --- Measurement Flags (Primary) ---
     # parser.add_argument('--fullbs', action='store_true', help='If set, compute the lambda_max, aka FullBS')
     parser.add_argument('--lambdamax', '--lmax', action='store_true', help='If set, compute the lambda_max, aka FullBS')
+    parser.add_argument('--lambda-max-gn', '--lambda_max_gn', action='store_true', dest='lambda_max_gn',
+                        help='Compute the Gauss-Newton lambda_max on the full batch (same cadence as --lambdamax).')
+    parser.add_argument('--step-batch-lambda-max', action='store_true', dest='step_batch_lambda_max',
+                        help='Compute the Hessian lambda_max on the current mini-batch (single-step batch lambda).')
     parser.add_argument('--batch-sharpness', '--batch-sharpness-step', '--bs', action='store_true', dest='batch_sharpness',
                         help='If set, compute the batch sharpness: E[gHg/g²] with the expectation taken across mini-batches. Use --batch-sharpness-step for backward compatibility.')
+    parser.add_argument('--batch-sharpness-gn', '--batch_sharpness_gn', action='store_true', dest='batch_sharpness_gn',
+                        help='Compute the Gauss-Newton batch sharpness (same cadence as --batch-sharpness).')
+    parser.add_argument('--momentum-bs', action='store_true', dest='momentum_bs',
+                        help='Compute momentum-aware batch sharpness: E[sHs/(s·g)] with s = μ v + g for SGD with momentum.')
     parser.add_argument('--step-sharpness', action='store_true', dest='step_sharpness',
                         help='If set, compute the step sharpness: the current-mini-batch Rayleigh quotient g·Hg/g². Average across steps to recover the traditional batch sharpness.')
     parser.add_argument('--gni', action='store_true', help='If set, compute the Gradient-Noise Interaction quantity.')
 
     # --- Measurement Flags (Secondary, aka still useful) ---
+    parser.add_argument('--second-moment-contraction', '--second_moment_contraction', action='store_true',
+                        help='If set, estimate the top eigenvalue of E[(I - η H_B)^2] using Lanczos with the current learning rate η and batch size.')
     parser.add_argument('--hessian-trace', action='store_true', help='Estimate the trace of the full-batch loss Hessian via a Hutchinson-style estimator')
     parser.add_argument('--grad-projection', action='store_true', help='Compute grad_projection_i: fraction of full-batch gradient lying in span of top-i cached Hessian eigenvectors (i up to 20); uses cached eigenvectors only; only for plain SGD')
     parser.add_argument('--one-step-loss-change', action='store_true', help='If set, compute the expected one-step change in loss using Monte Carlo estimation')
     parser.add_argument('--gradient-norm', action='store_true', help='If set, compute the Monte Carlo estimate of squared norm of mini-batch gradients')
     parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and step sharpness at the end')
+    parser.add_argument('--force-full-loss', action='store_true',
+                        help='Force periodic logging of the full-batch loss/accuracy throughout training.')
 
     
     # --- Measurement Flags (Tertiary, aka almost completely useless) ---
     parser.add_argument('--batch-sharpness-exp-inside', action='store_true', help='If set, compute the batch sharpness using E[gHg]/E[g²], where the expectation is inside the ratio. Compare with step-sharpness, where the expectation stays outside the ratio.')
-    parser.add_argument('--batch-lambdamax','--batchlmax', action='store_true', help='If set, compute the batch lambda_max(H_B), aka batch lambda max')
+    parser.add_argument('--batch-lambda-max','--batch-lmax', action='store_true', help='If set, compute the batch lambda_max(H_B), aka batch lambda max')
     parser.add_argument('--fisher', action='store_true', help='If set, compute Fisher information matrix eigenvalue. Currently only works with one-dim output')
     parser.add_argument('--param-distance', '--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
     parser.add_argument('--param-file', '--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
+    parser.add_argument('--save-trajectory', action='store_true', help='If set, save sparse JL parameter projections for trajectory comparison')
 
     # --- Measurement Configuration ---
     parser.add_argument('--disable-cache-eigenvectors', '--disable_cache_eigenvectors', action='store_true', help='If set, disable eigenvector caching for warm starts to improve eigenvalue computation performance')
@@ -1014,6 +1454,8 @@ if __name__ == '__main__':
     parser.add_argument('--results-rarely', '--results_rarely', action='store_true', help='If set, results will be recorded less frequently')
     parser.add_argument('--precise-plots', action='store_true', help='Enable more frequent measurements for precise plotting')
     parser.add_argument('--rare-measure', dest='rare_measure', action='store_true', help='Activate regime where expensive measurements are performed rarely')
+    parser.add_argument('--full-loss-warmup', action='store_true',
+                        help='Force full-batch loss measurements at every step for the first few iterations after (re)start')
 
     # --- Noise Configuration ---
     parser.add_argument('--gd-noise', '--gd_noise', type=str, default=None, help='Do noisy GD, to simulate SGD. Supported noises: sgd, diag, iso, const')
@@ -1047,6 +1489,8 @@ if __name__ == '__main__':
     parser.add_argument('--wandb-name', type=str, default=None, help='Optional suffix appended to default wandb run name (sanitized)')
     parser.add_argument('--wandb-notes', type=str, default=None, help='Optional notes/description attached to the wandb run')
     parser.add_argument('--disable-wandb', action='store_true', help='Disable Weights & Biases logging for debugging/testing')
+    parser.add_argument('--save-only-last-checkpoint', '--save_only_last_checkpoint', action='store_true',
+                        help='If set, only the last checkpoint will be saved (saves space)')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -1082,11 +1526,11 @@ if __name__ == '__main__':
     if args.momentum is not None and args.momentum < 1e-4 and not args.adam:
         args.momentum = None  # if momentum is too small, just use SGD without momentum
 
+    if args.momentum_bs and (args.momentum is None or args.momentum <= 0 or args.adam):
+        raise ValueError("--momentum-bs requires SGD with momentum > 0 and is not supported with Adam.")
+
     
     # --- Argument Validation ---
-    if args.final:
-        raise ValueError("--final needs to be re-implemented")
-
     if args.param_distance:
         raise NotImplementedError("--param-distance needs to be re-implemented")
 
@@ -1123,10 +1567,15 @@ if __name__ == '__main__':
     # ----- Measurement Selection -----
     measurements = {name for name, enabled in [
     ('lmax', args.lambdamax),
-    ('batch_lmax', args.batch_lambdamax),
+    ('lambda_max_gn', args.lambda_max_gn),
+    ('step_batch_lambda_max', args.step_batch_lambda_max),
+    ('batch_lambda_max', args.batch_lambda_max),
     ('step_sharpness', args.step_sharpness),
     ('batch_sharpness', args.batch_sharpness),
+    ('batch_sharpness_gn', args.batch_sharpness_gn),
+    ('momentum_batch_sharpness', args.momentum_bs),
     ('batch_sharpness_exp_inside', args.batch_sharpness_exp_inside),
+    ('second_moment_contraction', getattr(args, 'second_moment_contraction', False)),
     ('grad_projection', args.grad_projection),
     ('gradient_norm', args.gradient_norm),
     ('one_step_loss_change', args.one_step_loss_change),
@@ -1135,6 +1584,9 @@ if __name__ == '__main__':
     ('final', args.final),
     ('param_distance', args.param_distance),
     ('hessian_trace', args.hessian_trace),
+    ('full_loss_warmup', args.full_loss_warmup),
+    ('full_loss', args.force_full_loss),
+    ('trajectory_projection', args.save_trajectory),
     ] if enabled}
 
     # ----- Result Storage Setup -----
@@ -1229,11 +1681,16 @@ if __name__ == '__main__':
     optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam)
 
     # ----- Checkpoint Cadence Determination -----
-    if args.checkpoint_every is not None:
-        checkpoint_every_n_steps = args.checkpoint_every
-    else:
-        checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
-    
+    # if args.checkpoint_every is not None:
+    checkpoint_every_n_steps = args.checkpoint_every
+    # else:
+    #     checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
+    # save_only_last_checkpoint = args.save_only_last_checkpoint
+    if len(measurements) == 0 or (len(measurements) == 1 and 'final' in measurements) or args.save_only_last_checkpoint:
+        checkpoint_every_n_steps = 1_000_000_000 # effectively disable intermediate checkpoints
+
+
+
     # ----- Training Invocation -----
     train(
         net=net,
@@ -1267,9 +1724,11 @@ if __name__ == '__main__':
         use_gauss_newton=args.use_gauss_newton,
         precise_plots=args.precise_plots,
         rare_measure=args.rare_measure,
+        full_loss_warmup=args.full_loss_warmup,
         proj_switch_step=args.proj_switch_step,
         proj_top_l=args.proj_top_l,
         proj_to_residual=args.proj_to_residual,
+        data_ordering_seed=args.data_ordering_seed,
         wandb_run=wandb_run,
         wandb_enabled=wandb_enabled,
         wandb_run_id=wandb_run_id,

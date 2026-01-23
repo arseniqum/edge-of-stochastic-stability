@@ -102,11 +102,14 @@ def init_wandb(args, step_to_start):
     # use global step (column 1) as the x-axis for everything else
     wandb.define_metric("step")
     for m in [
-        "batch_loss","full_loss","batch_lambda_max","lambda_max",
-        "step_sharpness","batch_sharpn","grad_H_grad","batch_fisher_eigenval",
+        "batch_loss","full_loss","batch_lambda_max","lambda_max","lambda_max_gn",
+        "step_batch_lambda_max", "max_batch_lambda_max",
+        "step_sharpness","batch_sharpn","batch_sharpn_gn","momentum_bs","grad_H_grad","batch_fisher_eigenval",
         "total_fisher_eigenval","sharpness_static","GNI","accuracy",
-        "hessian_trace",
-        "param_distance","gradient_norm_squared","quadratic_loss_gn","proj_grad_ratio"
+        "hessian_trace","second_moment_contraction",
+        "param_distance","gradient_norm_squared","quadratic_loss_gn","proj_grad_ratio",
+        "trajectory_proj_norm",
+        "final_lambda_max","final_full_loss","final_accuracy"
     ]:
         wandb.define_metric(m, step_metric="step")
 
@@ -267,6 +270,130 @@ def save_checkpoint_wandb(model, optimizer, step, epoch, loss, run_id=None, save
         json.dump(metadata, f, indent=2)
     
     return checkpoint_path
+
+
+def _trajectory_dir(run_id: str) -> Path:
+    """
+    Return the directory where trajectory projections are stored for a run.
+    Mirrors checkpoint directory structure for consistency.
+    """
+    wandb_dir = Path(os.environ.get("WANDB_DIR", "."))
+    trajectory_base_dir = wandb_dir / "wandb_trajectories"
+    return trajectory_base_dir / run_id
+
+
+def save_trajectory_projection(projection: torch.Tensor, step: int, run_id: str = None, save_every_n_steps: int = None):
+    """
+    Save a parameter projection for trajectory comparison, analogous to checkpoint saving.
+
+    Parameters
+    ----------
+    projection : torch.Tensor
+        Projected parameter vector (will be moved to CPU before saving).
+    step : int
+        Training step.
+    run_id : str, optional
+        Wandb run ID. If None, uses current wandb run when available.
+    save_every_n_steps : int, optional
+        If provided, only save when step % save_every_n_steps == 0.
+
+    Returns
+    -------
+    Path or None
+        Path to saved projection, or None if skipped due to cadence.
+    """
+    if save_every_n_steps is not None and step % save_every_n_steps != 0:
+        return None
+
+    if run_id is None:
+        if not WANDB_AVAILABLE or wandb.run is None:  # type: ignore[truthy-bool]
+            raise RuntimeError("run_id must be provided when wandb is disabled.")
+        run_id = wandb.run.id  # type: ignore[assignment]
+
+    trajectory_dir = _trajectory_dir(run_id)
+    trajectory_dir.mkdir(parents=True, exist_ok=True)
+
+    projection_path = trajectory_dir / f"trajectory_step_{step}.pt"
+    payload = {
+        "projection": projection.detach().cpu(),
+        "step": step,
+        "run_id": run_id,
+    }
+    torch.save(payload, projection_path)
+
+    metadata_path = trajectory_dir / "trajectory_metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+    else:
+        metadata = {'trajectories': []}
+
+    entry = {
+        "step": step,
+        "filename": projection_path.name,
+        "path": str(projection_path),
+    }
+    metadata['trajectories'] = [c for c in metadata['trajectories'] if c['step'] != step]
+    metadata['trajectories'].append(entry)
+    metadata['trajectories'].sort(key=lambda x: x['step'])
+
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    return projection_path
+
+
+def find_closest_trajectory_projection(target_step: int, run_id: str = None, trajectory_dir: Path = None):
+    """
+    Find the trajectory projection with step closest to (but not exceeding) target_step.
+    """
+    if trajectory_dir is None:
+        if run_id is None:
+            if not WANDB_AVAILABLE or wandb.run is None:  # type: ignore[truthy-bool]
+                raise RuntimeError("run_id must be provided when wandb is disabled.")
+            run_id = wandb.run.id  # type: ignore[assignment]
+        trajectory_dir = _trajectory_dir(run_id)
+        if not trajectory_dir.exists():
+            return None
+    else:
+        trajectory_dir = Path(trajectory_dir)
+
+    metadata_path = trajectory_dir / "trajectory_metadata.json"
+    if not metadata_path.exists():
+        return None
+
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    trajectories = metadata.get('trajectories', [])
+    if not trajectories:
+        return None
+
+    candidates = [c for c in trajectories if c['step'] <= target_step]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda x: x['step'])
+
+
+def load_trajectory_projection(projection_info, map_location=None):
+    """
+    Load a saved trajectory projection payload.
+    """
+    projection_path = Path(projection_info['path'])
+    if not projection_path.exists():
+        raise FileNotFoundError(f"Trajectory projection not found: {projection_path}")
+    payload = torch.load(projection_path, map_location=map_location)
+    return payload
+
+
+def get_trajectory_dir_for_run(run_id: str):
+    """
+    Get trajectory projection directory for a specific run ID.
+    """
+    trajectory_dir = _trajectory_dir(run_id)
+    if trajectory_dir.exists():
+        return trajectory_dir
+    return None
 
 
 def find_closest_checkpoint_wandb(target_step, run_id=None, checkpoint_dir=None):

@@ -1,5 +1,8 @@
+import json
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Mapping
 
 
 def get_welcome_string(args):
@@ -54,3 +57,23 @@ def initialize_folders(args, results_folder):
         f.write(welcome_string + "\n")
 
     return runs_folder
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, Any], *, indent: int = 2) -> None:
+    """
+    Persist a mapping as JSON using a temporary file to avoid partial writes.
+
+    Parameters
+    ----------
+    path : Path
+        Destination file path.
+    payload : Mapping[str, Any]
+        Data to serialise as JSON.
+    indent : int, optional
+        Indentation level for pretty-printing. Default is 2.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open('w', encoding='utf-8') as handle:
+        json.dump(payload, handle, indent=indent, sort_keys=True)
+    tmp_path.replace(path)

@@ -41,7 +41,7 @@ if 'RESULTS' not in os.environ:
     raise ValueError("Please set the environment variable 'RESULTS'. Use 'export RESULTS=/path/to/results'")
 
 DATASET_FOLDER = Path(os.environ.get('DATASETS')).expanduser()
-# export RESULTS=/scratch/gpfs/andreyev/eoss/results
+# export RESULTS=/path/to/results
 RES_FOLDER = Path(os.environ.get('RESULTS')).expanduser()
 
 

@@ -1,6 +1,6 @@
-# Edge of Stochastic Stability (EoSS)
+# Research Training Codebase
 
-This repository accompanies the paper [Edge of Stochastic Stability: Revisiting the Edge of Stability for SGD](https://arxiv.org/abs/2412.20553) by Arseniy Andreyev and Pierfrancesco Beneventano. Feel free to reuse it in any way - if you ended up using this code, please consider citing it by citing our paper.
+This repository contains code for experiments on stochastic stability in SGD. The instructions below are written to be reusable without author- or institution-specific references.
 
 ## Key Capabilities
 - Run training for MLP/CNN/ResNet on CIFAR‑10/Fashion‑MNIST/SVHN with SGD, SGDM, or Adam.

@@ -36,7 +36,7 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
   If you are running on MacOS, this might fail because the python process doesn't have disk access. A *potential* solution is to enable full disk access in System Settings.
 - **Sanity run (CPU-friendly)**:
   ```bash
-  python training.py --dataset cifar10 --model mlp --batch 4 --lr 0.05 \
+  python training.py --dataset cifar10 --model mlp --loss mse --batch 4 --lr 0.05 \
   --steps 1000 --num-data 64 \
   --lambdamax --batch-sharpness --disable-wandb \
   --cpu --use-power-iteration
@@ -69,10 +69,10 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
 
 - **Launching training**
   ```bash
-  python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
+  python training.py --dataset cifar10 --model mlp --loss mse --batch 8 --lr 0.01 \
     --steps 150000 --num-data 8192 \
     --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
-    --stop-loss 0.00001 
+    --stop-loss 0.00001 \
     --lambdamax --batch-sharpness
   ```
   Note: this is too computationally demanding to run on CPU - recommended to run on GPU, e.g. through slurm
@@ -81,6 +81,7 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
   - `init-scale` regulates the size of initilization. tldr: for consistency, we have to start with a low initialization. See Appendix for details
   - This tracks two most important measurements: lambda_max and batch sharpness
   - The code automatically detects if there is cuda present, and runs on it. Use an explicit --cpu switch if you really want to run on cpu
+  - Paper note: unless stated otherwise, the classification experiments in the paper use squared loss (`--loss mse`) rather than cross-entropy. `mse` is the CLI default, but it is better to pass it explicitly when reproducing runs.
 
 - **Uploading results to wandb**
   ```bash
@@ -96,7 +97,7 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
 Use `visualization/template.ipynb` for visualizing runs. This notebook should be extended for more concrete plots. One can either specify the wandb ids to plot (can be taken e.g. from the run's url in the web interface), or pull all the runs from one tag (convenient for sweeps, see below)
 
 ## Varying hyperparameters
-- Refer to the following in the Appendix: Default Hyperparameters and 
+- Refer to the following in the Appendix: Default Hyperparameters and On Initialization of NNs
 - You can start with changing the learning rate/step size: notice how the 2/η threshold moves
 - Changing batch size: notice how the level of stabilization of lambda_max changes (the bigger the batch size, the higher the level)
 - If you set learning rate as too low (relative to the "difficulty" of the problem), you might not enter EoSS regime. That is, you are going to converge before progressive sharpening brings you to regime of instability, and batch sharpness stabilizes below 2/η.
@@ -129,13 +130,57 @@ Use `notebooks/view_landscape.ipynb` for an example of a notebook that loads a s
 
 ## Continuing a run
 You need forking functionality to be enabled in wandb for this to work (see above). 
-Resume a run witch changed hyperparameters (e.g. reducing learning rate)
+Resume a run with changed hyperparameters (e.g. reducing learning rate)
   ```bash
-python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
+python training.py --dataset cifar10 --model mlp --loss mse --batch 8 --lr 0.01 \
   --steps 150000 --num-data 8192 \
   --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
-  --cont-run-id <run_id> --cont-step <approx_step> \
+  --cont-run-id <run_id> --cont-step <approx_step>
   ```
+
+## Checkpoint Perturbations
+The intervention experiments in the paper use checkpoint forks: start from the same saved checkpoint, keep everything fixed, and then change one destabilizing hyperparameter.
+
+1. Run and save a baseline trajectory with fixed seeds. If you want continuation branches to see the same epoch-wise batch order, also set `--data-ordering-seed`.
+2. Pick a checkpoint near the regime you want to probe.
+3. Launch a control continuation from that checkpoint with the original hyperparameters.
+4. Launch a second continuation from the same checkpoint, changing only one destabilizing parameter: increase `--lr` or decrease `--batch`.
+5. Compare the loss, Batch Sharpness, and `lambda_max` trajectories of the two branches.
+
+Example:
+```bash
+# Control branch
+python training.py --dataset cifar10 --model mlp --loss mse --batch 16 --lr 0.01 \
+  --steps 100000 --num-data 8192 --init-scale 0.2 \
+  --dataset-seed 1011 --data-ordering-seed 2025 --init-seed 1312 \
+  --lambdamax --batch-sharpness \
+  --cont-run-id <run_id> --cont-step <step>
+
+# Perturbed branch: increase the learning rate, keep everything else fixed
+python training.py --dataset cifar10 --model mlp --loss mse --batch 16 --lr 0.02 \
+  --steps 100000 --num-data 8192 --init-scale 0.2 \
+  --dataset-seed 1011 --data-ordering-seed 2025 --init-seed 1312 \
+  --lambdamax --batch-sharpness \
+  --cont-run-id <run_id> --cont-step <step>
+```
+
+## Noisy-GD and SDE Baselines
+The paper also compares SGD against noisy full-batch baselines. Start from the same base command you would use for SGD and switch the training mode:
+
+- Gaussian resampling / anisotropic noisy GD: `--gd-noise sgd`
+- Diagonal noisy GD: `--gd-noise diag`
+- Isotropic noisy GD: `--gd-noise iso`
+- SDE baseline: `--sde --sde-h 0.0005`
+
+Those modes are mutually exclusive with the regular SGD loop. Keep `--batch` in the command, since it sets the effective noise scale.
+
+Example:
+```bash
+python training.py --dataset cifar10 --model mlp --loss mse --batch 16 --lr 0.01 \
+  --steps 100000 --num-data 8192 --init-scale 0.2 \
+  --dataset-seed 1011 --init-seed 1312 \
+  --lambdamax --batch-sharpness --gd-noise sgd
+```
 
 
 ## How to run hyperparameter sweeps
@@ -168,6 +213,13 @@ There is a somewhat rudimentary way to run hyperparameter sweeps. Basically, you
 
 ## Default Hyperparameters
 Choosing proper hyperparameters is non-trivial (e.g. if you batch size is very small, like 1 or 2, you have to set the step size much lower too, otherwise you are not going to have convergence). See also *On Initialization* below and *Varying Hyperparameters* above.
+
+Concrete defaults we usually start from for paper-style runs:
+- MLP: `--dataset cifar10 --model mlp --loss mse --batch 16 --lr 0.01 --num-data 8192 --init-scale 0.2 --stop-loss 1e-5`
+- CNN: `--dataset cifar10 --model cnn --loss mse --batch 8 --lr 0.02 --num-data 8192 --init-scale 0.3 --stop-loss 1e-4`
+- ResNet preset: `--dataset cifar10 --model resnet --loss mse --batch 8 --lr 0.02 --num-data 4096 --init-scale 0.2 --stop-loss 1e-4`
+- Representative seeds from our default launcher scripts: MLP `--dataset-seed 1011 --init-seed 1312`, CNN `--dataset-seed 234 --init-seed 674`, ResNet `--dataset-seed 482 --init-seed 51`
+- For the main EoSS diagnostics, also add `--lambdamax --batch-sharpness`
 
 Here are default hyperparameters you can start with: (as of Jan 2025):
 - MLP: for `dataset_size` around 8k, you can do `lr=0.01` for `batch > 2`, but `lr=[2/80, 2/300]` should all be fine; you need smaller lr for e.g. `batch = 1`; `init-scale=0.2`
